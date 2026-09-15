@@ -1,11 +1,11 @@
 import asyncio
+import os
 import threading
 import time
 
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from ultralytics import YOLO
 
 from .event_engine import EventEngine
@@ -26,6 +26,21 @@ IMG_SIZE = 320
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 360
 CAMERA_FPS = 15
+
+# Local:
+#   VISIONSENSE_MODE=local
+#
+# Cloud:
+#   VISIONSENSE_MODE=demo
+#
+# Local mode uses your webcam.
+# Demo mode uses demo/demo.mp4.
+MODE = os.getenv("VISIONSENSE_MODE", "local").lower()
+
+DEMO_VIDEO_PATH = os.getenv(
+    "VISIONSENSE_DEMO_VIDEO",
+    "demo/demo.mp4"
+)
 
 
 # ============================================================
@@ -49,7 +64,7 @@ app.add_middleware(
 
 
 # ============================================================
-# VISION COMPONENTS
+# INTELLIGENCE ENGINES
 # ============================================================
 
 event_engine = EventEngine()
@@ -62,35 +77,30 @@ activity_timeline = ActivityTimeline()
 
 
 # ============================================================
-# YOLO MODEL
+# MODEL
 # ============================================================
 
 model = YOLO(MODEL_PATH)
 
 
 # ============================================================
-# CAMERA
+# GLOBAL STATE
 # ============================================================
 
 cap = None
-
-camera_thread = None
-
-main_loop = None
-
-
-# ============================================================
-# LIVE VIDEO FRAME
-# ============================================================
 
 latest_frame = None
 
 frame_lock = threading.Lock()
 
+camera_thread = None
 
-# ============================================================
-# SYSTEM STATE
-# ============================================================
+main_loop = None
+
+connected_clients = set()
+
+last_event_sequence = -1
+
 
 system_state = {
     "running": False,
@@ -98,22 +108,14 @@ system_state = {
     "model": "YOLO11n",
     "tracker": "ByteTrack",
     "analytics": "ONLINE",
+    "mode": MODE,
     "current_people": 0,
     "last_update": None
 }
 
 
 # ============================================================
-# WEBSOCKET CLIENTS
-# ============================================================
-
-connected_clients = set()
-
-last_event_sequence = -1
-
-
-# ============================================================
-# EVENT BROADCAST
+# WEBSOCKET EVENTS
 # ============================================================
 
 async def broadcast_event(event):
@@ -130,41 +132,328 @@ async def broadcast_event(event):
 
             disconnected.add(websocket)
 
-
     for websocket in disconnected:
 
         connected_clients.discard(websocket)
 
 
 # ============================================================
-# CAMERA PROCESSING
+# PROCESS FRAME
+# ============================================================
+
+def process_frame(frame):
+
+    global last_event_sequence
+    global latest_frame
+
+    results = model.track(
+        frame,
+        imgsz=IMG_SIZE,
+        conf=CONFIDENCE,
+        persist=True,
+        tracker="bytetrack.yaml",
+        verbose=False
+    )
+
+    current_ids = []
+
+    # --------------------------------------------------------
+    # DETECTIONS
+    # --------------------------------------------------------
+
+    if results[0].boxes is not None:
+
+        for box in results[0].boxes:
+
+            if box.id is None:
+                continue
+
+            coords = (
+                box.xyxy[0]
+                .cpu()
+                .numpy()
+                .astype(int)
+            )
+
+            x1, y1, x2, y2 = coords
+
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+
+            x2 = min(
+                frame.shape[1],
+                x2
+            )
+
+            y2 = min(
+                frame.shape[0],
+                y2
+            )
+
+            person_id = int(box.id[0])
+
+            center_x = int(
+                (x1 + x2) / 2
+            )
+
+            center_y = int(
+                (y1 + y2) / 2
+            )
+
+
+            # ------------------------------------------------
+            # MOVEMENT
+            # ------------------------------------------------
+
+            movement = movement_engine.update(
+                person_id,
+                (center_x, center_y)
+            )
+
+
+            event_engine.update_movement(
+                person_id,
+                movement["state"],
+                movement["direction"],
+                movement["speed"]
+            )
+
+
+            session_analytics.record_movement(
+                movement["state"],
+                movement["direction"]
+            )
+
+
+            current_ids.append(person_id)
+
+
+            # ------------------------------------------------
+            # DRAW PERSON BOX
+            # ------------------------------------------------
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+
+            # ------------------------------------------------
+            # PERSON LABEL
+            # ------------------------------------------------
+
+            label = (
+                f"ID {person_id}: "
+                f"{movement['state']}"
+            )
+
+
+            cv2.putText(
+                frame,
+                label,
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2
+            )
+
+
+    # --------------------------------------------------------
+    # CLEAN OLD TRACKS
+    # --------------------------------------------------------
+
+    movement_engine.remove_old_tracks()
+
+
+    # --------------------------------------------------------
+    # EVENTS
+    # --------------------------------------------------------
+
+    entered, exited = event_engine.update_people(
+        current_ids
+    )
+
+
+    # --------------------------------------------------------
+    # SESSION ANALYTICS
+    # --------------------------------------------------------
+
+    session_analytics.update_people(
+        current_ids
+    )
+
+
+    for person_id in entered:
+
+        session_analytics.record_entry(
+            person_id
+        )
+
+
+    for person_id in exited:
+
+        session_analytics.record_exit(
+            person_id
+        )
+
+
+    # --------------------------------------------------------
+    # ACTIVITY TIMELINE
+    # --------------------------------------------------------
+
+    new_events = event_engine.get_events_since(
+        last_event_sequence
+    )
+
+
+    if new_events:
+
+        activity_timeline.add_events(
+            new_events
+        )
+
+        last_event_sequence = (
+            new_events[-1]["sequence"]
+        )
+
+
+        if main_loop is not None:
+
+            for event in new_events:
+
+                try:
+
+                    asyncio.run_coroutine_threadsafe(
+                        broadcast_event(event),
+                        main_loop
+                    )
+
+                except Exception:
+
+                    pass
+
+
+    # --------------------------------------------------------
+    # UPDATE SYSTEM STATE
+    # --------------------------------------------------------
+
+    stats = session_analytics.get_stats()
+
+
+    system_state["current_people"] = (
+        stats["current_people"]
+    )
+
+    system_state["last_update"] = time.time()
+
+
+    # --------------------------------------------------------
+    # TOP-LEFT UI
+    # --------------------------------------------------------
+
+    cv2.putText(
+        frame,
+        f"PEOPLE: {stats['current_people']}",
+        (15, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2
+    )
+
+
+    cv2.putText(
+        frame,
+        f"MODE: {MODE.upper()}",
+        (15, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+
+    # --------------------------------------------------------
+    # STORE LATEST FRAME
+    # --------------------------------------------------------
+
+    with frame_lock:
+
+        latest_frame = frame.copy()
+
+
+# ============================================================
+# CAMERA / DEMO ENGINE
 # ============================================================
 
 def process_camera():
 
     global cap
-    global latest_frame
-    global last_event_sequence
 
 
-    cap = cv2.VideoCapture(0)
+    # --------------------------------------------------------
+    # LOCAL WEBCAM
+    # --------------------------------------------------------
+
+    if MODE == "local":
+
+        cap = cv2.VideoCapture(0)
+
+        cap.set(
+            cv2.CAP_PROP_FRAME_WIDTH,
+            CAMERA_WIDTH
+        )
+
+        cap.set(
+            cv2.CAP_PROP_FRAME_HEIGHT,
+            CAMERA_HEIGHT
+        )
+
+        cap.set(
+            cv2.CAP_PROP_FPS,
+            CAMERA_FPS
+        )
 
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        CAMERA_WIDTH
-    )
+    # --------------------------------------------------------
+    # DEMO VIDEO
+    # --------------------------------------------------------
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        CAMERA_HEIGHT
-    )
+    else:
 
-    cap.set(
-        cv2.CAP_PROP_FPS,
-        CAMERA_FPS
-    )
+        if not os.path.exists(
+            DEMO_VIDEO_PATH
+        ):
 
+            print(
+                "ERROR: Demo video not found:"
+            )
+
+            print(
+                DEMO_VIDEO_PATH
+            )
+
+            system_state["camera"] = (
+                "DEMO VIDEO MISSING"
+            )
+
+            system_state["running"] = False
+
+            return
+
+
+        cap = cv2.VideoCapture(
+            DEMO_VIDEO_PATH
+        )
+
+
+    # --------------------------------------------------------
+    # CAMERA CHECK
+    # --------------------------------------------------------
 
     if not cap.isOpened():
 
@@ -173,11 +462,15 @@ def process_camera():
         system_state["running"] = False
 
         print(
-            "ERROR: Camera could not be opened."
+            "ERROR: Video source could not be opened."
         )
 
         return
 
+
+    # --------------------------------------------------------
+    # ONLINE
+    # --------------------------------------------------------
 
     system_state["camera"] = "ONLINE"
 
@@ -197,7 +490,11 @@ def process_camera():
     )
 
     print(
-        "Camera: ONLINE"
+        f"Mode: {MODE.upper()}"
+    )
+
+    print(
+        "Video Source: ONLINE"
     )
 
     print(
@@ -213,10 +510,6 @@ def process_camera():
     )
 
     print(
-        "Video Feed: ONLINE"
-    )
-
-    print(
         "API: ONLINE"
     )
 
@@ -225,365 +518,89 @@ def process_camera():
     )
 
 
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
+
     while system_state["running"]:
 
         ret, frame = cap.read()
 
 
+        # ----------------------------------------------------
+        # DEMO VIDEO LOOP
+        # ----------------------------------------------------
+
+        if not ret and MODE == "demo":
+
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                0
+            )
+
+            ret, frame = cap.read()
+
+
+        # ----------------------------------------------------
+        # CAMERA FAILURE
+        # ----------------------------------------------------
+
         if not ret:
-
-            continue
-
-
-        # ====================================================
-        # YOLO TRACKING
-        # ====================================================
-
-        results = model.track(
-            frame,
-            imgsz=IMG_SIZE,
-            conf=CONFIDENCE,
-            persist=True,
-            tracker="bytetrack.yaml",
-            verbose=False
-        )
-
-
-        current_ids = []
-
-
-        # ====================================================
-        # DETECTIONS
-        # ====================================================
-
-        if results[0].boxes is not None:
-
-            for box in results[0].boxes:
-
-                if box.id is None:
-
-                    continue
-
-
-                coords = (
-                    box.xyxy[0]
-                    .cpu()
-                    .numpy()
-                    .astype(int)
-                )
-
-
-                x1, y1, x2, y2 = coords
-
-
-                x1 = max(
-                    0,
-                    x1
-                )
-
-                y1 = max(
-                    0,
-                    y1
-                )
-
-                x2 = min(
-                    frame.shape[1],
-                    x2
-                )
-
-                y2 = min(
-                    frame.shape[0],
-                    y2
-                )
-
-
-                person_id = int(
-                    box.id[0]
-                )
-
-
-                center_x = int(
-                    (x1 + x2) / 2
-                )
-
-                center_y = int(
-                    (y1 + y2) / 2
-                )
-
-
-                # ====================================================
-                # MOVEMENT
-                # ====================================================
-
-                movement = movement_engine.update(
-                    person_id,
-                    (
-                        center_x,
-                        center_y
-                    )
-                )
-
-
-                # ====================================================
-                # EVENTS
-                # ====================================================
-
-                event_engine.update_movement(
-                    person_id,
-                    movement["state"],
-                    movement["direction"],
-                    movement["speed"]
-                )
-
-
-                # ====================================================
-                # ANALYTICS
-                # ====================================================
-
-                session_analytics.record_movement(
-                    movement["state"],
-                    movement["direction"]
-                )
-
-
-                current_ids.append(
-                    person_id
-                )
-
-
-                # ====================================================
-                # DRAW DETECTION BOX
-                # ====================================================
-
-                cv2.rectangle(
-                    frame,
-                    (x1, y1),
-                    (x2, y2),
-                    (255, 255, 255),
-                    2
-                )
-
-
-                # ====================================================
-                # PERSON LABEL
-                # ====================================================
-
-                label = (
-                    f"ID {person_id}  "
-                    f"{movement['state']}"
-                )
-
-
-                label_y = max(
-                    y1 - 10,
-                    20
-                )
-
-
-                cv2.putText(
-                    frame,
-                    label,
-                    (x1, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA
-                )
-
-
-        # ====================================================
-        # CLEAN OLD TRACKS
-        # ====================================================
-
-        movement_engine.remove_old_tracks()
-
-
-        # ====================================================
-        # ENTRY / EXIT EVENTS
-        # ====================================================
-
-        entered, exited = event_engine.update_people(
-            current_ids
-        )
-
-
-        # ====================================================
-        # SESSION ANALYTICS
-        # ====================================================
-
-        session_analytics.update_people(
-            current_ids
-        )
-
-
-        for person_id in entered:
-
-            session_analytics.record_entry(
-                person_id
-            )
-
-
-        for person_id in exited:
-
-            session_analytics.record_exit(
-                person_id
-            )
-
-
-        # ====================================================
-        # NEW EVENTS
-        # ====================================================
-
-        new_events = event_engine.get_events_since(
-            last_event_sequence
-        )
-
-
-        if new_events:
-
-            activity_timeline.add_events(
-                new_events
-            )
-
-
-            last_event_sequence = (
-                new_events[-1]["sequence"]
-            )
-
-
-            if main_loop is not None:
-
-                for event in new_events:
-
-                    try:
-
-                        asyncio.run_coroutine_threadsafe(
-                            broadcast_event(event),
-                            main_loop
-                        )
-
-                    except Exception:
-
-                        pass
-
-
-        # ====================================================
-        # UPDATE SYSTEM STATE
-        # ====================================================
-
-        stats = session_analytics.get_stats()
-
-
-        system_state["current_people"] = (
-            stats["current_people"]
-        )
-
-
-        system_state["last_update"] = (
-            time.time()
-        )
-
-
-        # ====================================================
-        # CAMERA STATUS OVERLAY
-        # ====================================================
-
-        cv2.putText(
-            frame,
-            "VISIONSENSE",
-            (15, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-
-        cv2.putText(
-            frame,
-            f"PEOPLE: {stats['current_people']}",
-            (15, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA
-        )
-
-
-        # ====================================================
-        # ENCODE FRAME FOR WEB STREAM
-        # ====================================================
-
-        success, encoded = cv2.imencode(
-            ".jpg",
-            frame,
-            [
-                cv2.IMWRITE_JPEG_QUALITY,
-                80
-            ]
-        )
-
-
-        if success:
-
-            with frame_lock:
-
-                latest_frame = encoded.tobytes()
-
-
-    # ============================================================
-    # SHUTDOWN CAMERA
-    # ============================================================
-
-    if cap is not None:
-
-        cap.release()
-
-
-    with frame_lock:
-
-        latest_frame = None
-
-
-    system_state["camera"] = "OFFLINE"
-
-    system_state["running"] = False
-
-
-# ============================================================
-# VIDEO STREAM GENERATOR
-# ============================================================
-
-def generate_video():
-
-    while True:
-
-        with frame_lock:
-
-            frame = latest_frame
-
-
-        if frame is None:
 
             time.sleep(0.05)
 
             continue
 
 
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + frame
-            + b"\r\n"
+        # ----------------------------------------------------
+        # RESIZE
+        # ----------------------------------------------------
+
+        frame = cv2.resize(
+            frame,
+            (
+                CAMERA_WIDTH,
+                CAMERA_HEIGHT
+            )
         )
 
+
+        # ----------------------------------------------------
+        # PROCESS
+        # ----------------------------------------------------
+
+        try:
+
+            process_frame(frame)
+
+        except Exception as error:
+
+            print(
+                f"Frame processing error: {error}"
+            )
+
+
+        # ----------------------------------------------------
+        # TARGET FPS
+        # ----------------------------------------------------
 
         time.sleep(
             1 / CAMERA_FPS
         )
+
+
+    # --------------------------------------------------------
+    # CLEANUP
+    # --------------------------------------------------------
+
+    if cap is not None:
+
+        cap.release()
+
+
+    system_state["camera"] = "OFFLINE"
+
+    system_state["running"] = False
 
 
 # ============================================================
@@ -595,7 +612,6 @@ async def startup_event():
 
     global camera_thread
     global main_loop
-
 
     main_loop = asyncio.get_running_loop()
 
@@ -627,28 +643,24 @@ def shutdown_event():
 def health():
 
     return {
+
         "status": "online",
-        "camera": system_state["camera"],
-        "model": system_state["model"],
-        "tracker": system_state["tracker"],
-        "analytics": system_state["analytics"]
+
+        "camera":
+            system_state["camera"],
+
+        "model":
+            system_state["model"],
+
+        "tracker":
+            system_state["tracker"],
+
+        "analytics":
+            system_state["analytics"],
+
+        "mode":
+            system_state["mode"]
     }
-
-
-# ============================================================
-# VIDEO FEED
-# ============================================================
-
-@app.get("/video_feed")
-def video_feed():
-
-    return StreamingResponse(
-        generate_video(),
-        media_type=(
-            "multipart/x-mixed-replace; "
-            "boundary=frame"
-        )
-    )
 
 
 # ============================================================
@@ -676,9 +688,7 @@ def status():
 # ============================================================
 
 @app.get("/events")
-def events(
-    limit: int = 20
-):
+def events(limit: int = 20):
 
     recent_events = (
         event_engine.get_recent_events(
@@ -686,10 +696,13 @@ def events(
         )
     )
 
-
     return {
-        "count": len(recent_events),
-        "events": recent_events
+
+        "count":
+            len(recent_events),
+
+        "events":
+            recent_events
     }
 
 
@@ -698,9 +711,7 @@ def events(
 # ============================================================
 
 @app.get("/timeline")
-def timeline(
-    limit: int = 20
-):
+def timeline(limit: int = 20):
 
     recent_events = (
         activity_timeline.get_recent(
@@ -708,10 +719,13 @@ def timeline(
         )
     )
 
-
     return {
-        "count": len(recent_events),
-        "events": recent_events
+
+        "count":
+            len(recent_events),
+
+        "events":
+            recent_events
     }
 
 
@@ -726,6 +740,78 @@ def latest_event():
 
 
 # ============================================================
+# VIDEO STREAM
+# ============================================================
+
+def generate_video():
+
+    while True:
+
+        with frame_lock:
+
+            frame = (
+                latest_frame.copy()
+                if latest_frame is not None
+                else None
+            )
+
+
+        if frame is None:
+
+            time.sleep(0.1)
+
+            continue
+
+
+        success, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                80
+            ]
+        )
+
+
+        if not success:
+
+            continue
+
+
+        frame_bytes = encoded.tobytes()
+
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + frame_bytes
+            + b"\r\n"
+        )
+
+
+        time.sleep(
+            1 / CAMERA_FPS
+        )
+
+
+@app.get("/video_feed")
+def video_feed():
+
+    from fastapi.responses import StreamingResponse
+
+
+    return StreamingResponse(
+
+        generate_video(),
+
+        media_type=(
+            "multipart/x-mixed-replace; "
+            "boundary=frame"
+        )
+    )
+
+
+# ============================================================
 # WEBSOCKET
 # ============================================================
 
@@ -735,7 +821,6 @@ async def websocket_events(
 ):
 
     await websocket.accept()
-
 
     connected_clients.add(
         websocket

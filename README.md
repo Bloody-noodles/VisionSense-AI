@@ -125,6 +125,16 @@ The trained detector achieved approximately:
 
 These metrics describe the held-out test evaluation for this project and should not be interpreted as general performance across every real-world environment.
 
+### Training artifacts
+
+The model training run and selected evaluation artifacts are maintained separately in the dedicated repository:
+
+**Person-Dataset:** https://github.com/Bloody-noodles/Person-Dataset
+
+That repository contains the training configuration, model checkpoints, results, evaluation curves, confusion matrices, label previews, and validation outputs generated during the YOLO11n training run.
+
+The separation keeps this application repository focused on the deployed VisionSense system while preserving the ML experiment as a reproducible portfolio record.
+
 ## Local Setup
 
 ### 1. Clone the repository
